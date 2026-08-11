@@ -5,3 +5,5 @@ temp_*
 *.log
 discovery-log.json
 rules.json
+data/option_levels_history.jsonl
+data/option_levels_chart_state.json
