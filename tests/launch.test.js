@@ -29,7 +29,7 @@ function mockChild({ failWith } = {}) {
  *   cdpBindsFor  — spawn paths (substring) after which probeCdp starts succeeding
  *   copyExists   — local copy already present
  */
-function msixDeps({ spawnFailures = [], cdpBindsFor = [], copyExists = false } = {}) {
+function msixDeps({ spawnFailures = [], spawnThrowsFor = [], cdpBindsFor = [], copyExists = false } = {}) {
   const state = { spawned: [], copies: [], removed: [], killed: 0, cdpUp: false };
   const deps = {
     existsSync: (p) => {
@@ -46,6 +46,9 @@ function msixDeps({ spawnFailures = [], cdpBindsFor = [], copyExists = false } =
     },
     spawn: (exe) => {
       state.spawned.push(exe);
+      if (spawnThrowsFor.some((s) => exe.includes(s))) {
+        throw Object.assign(new Error('spawn EPERM'), { code: 'EPERM' });
+      }
       const fail = spawnFailures.some((s) => exe.includes(s));
       if (!fail && cdpBindsFor.some((s) => exe.includes(s))) state.cdpUp = true;
       return mockChild(fail ? { failWith: 'EACCES' } : {});
@@ -114,6 +117,17 @@ describe('launch() — MSIX WindowsApps handling', { skip: !onWindows }, () => {
     assert.equal(result.msix_local_copy, true);
     assert.ok(result.warning);
   });
+
+  it('synchronous EPERM on direct spawn falls back to local copy', async () => {
+    const { deps, state } = msixDeps({ spawnThrowsFor: ['WindowsApps'], cdpBindsFor: ['tradingview-mcp'] });
+    const result = await launch({ _deps: deps });
+    assert.equal(result.success, true);
+    assert.equal(result.msix_local_copy, true);
+    assert.equal(result.binary, LOCAL_COPY_EXE);
+    assert.equal(state.spawned.length, 2);
+    assert.match(state.spawned[0], /WindowsApps/);
+    assert.match(state.spawned[1], /tradingview-mcp/);
+  });
 });
 
 describe('launch() — classic install path', { skip: !onWindows }, () => {
@@ -146,5 +160,20 @@ describe('launch() — classic install path', { skip: !onWindows }, () => {
       delay: async () => {}, probeCdp: async () => null,
     };
     await assert.rejects(() => launch({ _deps: deps }), /TradingView not found/);
+  });
+
+  it('rethrows a synchronous spawn error on non-MSIX paths', async () => {
+    const classicExe = `${process.env.LOCALAPPDATA}\\TradingView\\TradingView.exe`;
+    const deps = {
+      existsSync: (p) => p === classicExe,
+      execSync: (cmd) => { if (cmd.includes('taskkill')) return ''; throw new Error(`unexpected: ${cmd}`); },
+      spawn: () => { throw Object.assign(new Error('spawn EPERM'), { code: 'EPERM' }); },
+      cpSync: () => { throw new Error('should not copy'); },
+      rmSync: () => {},
+      readdirSync: () => [],
+      delay: async () => {},
+      probeCdp: async () => null,
+    };
+    await assert.rejects(() => launch({ _deps: deps }), /EPERM/);
   });
 });

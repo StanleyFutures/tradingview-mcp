@@ -264,7 +264,7 @@ async function _waitForCdp({ cdpPort, attempts, delay, probeCdp }) {
  * a plain directory outside WindowsApps works and keeps the user's session,
  * so copy the package into LOCALAPPDATA once per version and launch that.
  */
-function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync }) {
+function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync, execSync }) {
   const srcDir = dirname(tvPath);
   const pkgName = basename(srcDir);
   const cacheRoot = join(process.env.LOCALAPPDATA || '', 'tradingview-mcp');
@@ -278,7 +278,19 @@ function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync
         }
       }
     } catch { /* cache root may not exist yet */ }
-    cpSync(srcDir, dstDir, { recursive: true });
+
+    // Plain fs copy can itself get Access Denied inside WindowsApps. robocopy's
+    // /B (backup semantics) reads past those ACLs, but only when this process
+    // holds SeBackupPrivilege (i.e. is running elevated) — fall back to a plain
+    // copy for non-Windows or non-elevated runs where robocopy can't help either.
+    let copied = false;
+    if (process.platform === 'win32' && execSync) {
+      try {
+        execSync(`robocopy "${srcDir}" "${dstDir}" /E /B /NFL /NDL /NJH /NJS`, { timeout: 120000 });
+        copied = existsSync(dstExe);
+      } catch { /* robocopy exits >=8 on failure and execSync throws; fall through */ }
+    }
+    if (!copied) cpSync(srcDir, dstDir, { recursive: true });
   }
   return dstExe;
 }
@@ -360,12 +372,26 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   if (killFirst) await killExisting();
 
   const cdpArgs = [`--remote-debugging-port=${cdpPort}`];
-  let child = _spawnDetached(deps.spawn, tvPath, cdpArgs);
+  const isWindowsAppsPath = platform === 'win32' && WINDOWS_APPS_RE.test(tvPath);
+
+  // On some Windows builds, spawning a binary straight out of the ACL-protected
+  // WindowsApps folder throws EPERM/EACCES synchronously instead of emitting an
+  // async 'error' event — catch that here so it still reaches the local-copy
+  // fallback below instead of crashing launch() outright.
+  let child = null;
+  let syncSpawnError = null;
+  try {
+    child = _spawnDetached(deps.spawn, tvPath, cdpArgs);
+  } catch (e) {
+    if (!isWindowsAppsPath) throw e;
+    syncSpawnError = e.code || e.message || 'spawn error';
+  }
+
   let info = null;
   let usedLocalCopy = false;
 
-  if (platform === 'win32' && WINDOWS_APPS_RE.test(tvPath)) {
-    const earlyFailure = await _spawnFailedEarly(child);
+  if (isWindowsAppsPath) {
+    const earlyFailure = syncSpawnError || await _spawnFailedEarly(child);
     if (!earlyFailure) {
       info = await _waitForCdp({ cdpPort, attempts: 15, delay: deps.delay, probeCdp: deps.probeCdp });
     }
