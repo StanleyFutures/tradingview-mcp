@@ -38,6 +38,7 @@ function save(trades) {
  * @param {string[]} [p.tags] - e.g. ["gamma_wall_bounce", "cpi_reaction"]
  * @param {object} [p.context_at_entry] - whatever market context the caller gathered (spot, option levels, RSI, S/R, etc.)
  * @param {string} [p.symbol]
+ * @param {'manual'|'demo-auto'} [p.source] - 'manual' (default) for trades the user actually reports taking; 'demo-auto' for the hourly-analysis task's unattended paper-trading simulation. Keep these separable in stats — they answer different questions (does the system have edge? vs. how did the user's actual trading do?).
  */
 export function openTrade(p) {
   if (p.direction !== 'long' && p.direction !== 'short') throw new Error("direction must be 'long' or 'short'");
@@ -49,6 +50,7 @@ export function openTrade(p) {
   const trade = {
     id: `trade_${new Date().toISOString().replace(/[:.]/g, '-')}_${randomUUID().slice(0, 8)}`,
     status: 'open',
+    source: p.source || 'manual',
     opened_at: new Date().toISOString(),
     closed_at: null,
     symbol: p.symbol || 'BTCUSD',
@@ -69,6 +71,45 @@ export function openTrade(p) {
   trades.push(trade);
   save(trades);
   return trade;
+}
+
+/**
+ * Checks all open trades against a fresh price and auto-closes any whose
+ * stop_loss or take_profit has been crossed since entry — this is what lets
+ * an unattended hourly task run a paper-trading simulation without a human
+ * ever saying "I closed this". Closes at the level that was hit (not at
+ * currentPrice) since that's the realistic fill for a resting stop/limit
+ * order, not wherever price happens to be when this check runs.
+ * @param {number} currentPrice
+ * @returns {object[]} the trades that were closed by this call
+ */
+export function checkAndCloseHitTrades(currentPrice) {
+  const trades = load();
+  const closedNow = [];
+  for (const trade of trades) {
+    if (trade.status !== 'open') continue;
+    let hitPrice = null, reason = null;
+    if (trade.direction === 'long') {
+      if (currentPrice <= trade.stop_loss) { hitPrice = trade.stop_loss; reason = 'stop'; }
+      else if (trade.take_profit != null && currentPrice >= trade.take_profit) { hitPrice = trade.take_profit; reason = 'target'; }
+    } else {
+      if (currentPrice >= trade.stop_loss) { hitPrice = trade.stop_loss; reason = 'stop'; }
+      else if (trade.take_profit != null && currentPrice <= trade.take_profit) { hitPrice = trade.take_profit; reason = 'target'; }
+    }
+    if (hitPrice != null) {
+      const priceDelta = trade.direction === 'long' ? hitPrice - trade.entry_price : trade.entry_price - hitPrice;
+      const rMultiple = priceDelta / trade.risk_per_unit;
+      trade.status = 'closed';
+      trade.closed_at = new Date().toISOString();
+      trade.exit = { price: hitPrice, reason, notes: `auto-closed: price reached ${currentPrice}` };
+      trade.r_multiple = rMultiple;
+      trade.pnl_pct = (priceDelta / trade.entry_price) * 100;
+      trade.pnl_usd = trade.risk_usd != null ? rMultiple * trade.risk_usd : null;
+      closedNow.push(trade);
+    }
+  }
+  if (closedNow.length) save(trades);
+  return closedNow;
 }
 
 /**
@@ -106,9 +147,10 @@ export function listTrades(status) {
   return status ? trades.filter(t => t.status === status) : trades;
 }
 
-export function getStats(tagFilter) {
+export function getStats(tagFilter, sourceFilter) {
   let closed = load().filter(t => t.status === 'closed');
   if (tagFilter) closed = closed.filter(t => t.tags.includes(tagFilter));
+  if (sourceFilter) closed = closed.filter(t => t.source === sourceFilter);
   if (!closed.length) return { count: 0 };
 
   const wins = closed.filter(t => t.r_multiple > 0);
@@ -129,21 +171,36 @@ export function getStats(tagFilter) {
 }
 
 /** Break down stats by each tag seen across closed trades — surfaces which setup types actually work. */
-export function getStatsByTag() {
-  const closed = load().filter(t => t.status === 'closed');
+export function getStatsByTag(sourceFilter) {
+  let closed = load().filter(t => t.status === 'closed');
+  if (sourceFilter) closed = closed.filter(t => t.source === sourceFilter);
   const tags = new Set(closed.flatMap(t => t.tags));
   const out = {};
-  for (const tag of tags) out[tag] = getStats(tag);
+  for (const tag of tags) out[tag] = getStats(tag, sourceFilter);
   return out;
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const cmd = process.argv[2];
   if (cmd === 'stats') {
-    console.log(JSON.stringify({ overall: getStats(), by_tag: getStatsByTag() }, null, 2));
+    const source = process.argv[3]; // optional: 'manual' | 'demo-auto'
+    console.log(JSON.stringify({ overall: getStats(undefined, source), by_tag: getStatsByTag(source) }, null, 2));
   } else if (cmd === 'list') {
     console.log(JSON.stringify(listTrades(process.argv[3]), null, 2));
+  } else if (cmd === 'open') {
+    const payload = JSON.parse(process.argv[3]);
+    console.log(JSON.stringify(openTrade(payload), null, 2));
+  } else if (cmd === 'open-file') {
+    const payload = JSON.parse(readFileSync(process.argv[3], 'utf8'));
+    console.log(JSON.stringify(openTrade(payload), null, 2));
+  } else if (cmd === 'close') {
+    const [, , , id, priceStr, reason] = process.argv;
+    console.log(JSON.stringify(closeTrade(id, { exit_price: +priceStr, exit_reason: reason || 'manual' }), null, 2));
+  } else if (cmd === 'check-exits') {
+    const price = +process.argv[3];
+    if (!Number.isFinite(price)) throw new Error('check-exits requires a numeric current price');
+    console.log(JSON.stringify(checkAndCloseHitTrades(price), null, 2));
   } else {
-    console.log('Usage: node trade_journal.mjs stats | list [open|closed]');
+    console.log('Usage: node trade_journal.mjs stats | list [open|closed] | open \'<json>\' | open-file <path> | close <id> <price> [reason] | check-exits <price>');
   }
 }
