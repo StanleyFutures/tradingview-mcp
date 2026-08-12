@@ -125,6 +125,28 @@ export async function computeLevels() {
   const below = [...operational].filter(x => x < spot);
   const above = [...operational].filter(x => x > spot);
 
+  // --- IV skew (ported from report.py iv_metrics / weighted_skew_near_atm) ---
+  const byAtmDistance = [...rows].sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot));
+  const atmIv = byAtmDistance[0]?.mark_iv ?? null;
+
+  const otmCalls = calls.filter(r => r.strike > spot);
+  const otmPuts = puts.filter(r => r.strike < spot);
+  const mean = arr => arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : null;
+  const callWingIv = mean(otmCalls.map(r => r.mark_iv));
+  const putWingIv = mean(otmPuts.map(r => r.mark_iv));
+  const skew = (callWingIv != null && putWingIv != null) ? putWingIv - callWingIv : null;
+
+  function weightedAvg(arr, valueFn, weightFn) {
+    let num = 0, den = 0;
+    for (const r of arr) { const w = weightFn(r); num += valueFn(r) * w; den += w; }
+    return den > 0 ? num / den : null;
+  }
+  const distPct = r => Math.abs((r.strike - spot) / spot) * 100;
+  const weightFn = r => 1 / (distPct(r) + 0.25);
+  const callIvW = otmCalls.length ? weightedAvg(otmCalls, r => r.mark_iv, weightFn) : null;
+  const putIvW = otmPuts.length ? weightedAvg(otmPuts, r => r.mark_iv, weightFn) : null;
+  const weightedSkew = (callIvW != null && putIvW != null) ? putIvW - callIvW : null;
+
   return {
     spot,
     expiry: EXPIRY,
@@ -139,6 +161,11 @@ export async function computeLevels() {
     liquidity_top10: liq,
     nearest_support_operational: below.length ? Math.max(...below) : null,
     nearest_resistance_operational: above.length ? Math.min(...above) : null,
+    atm_iv: atmIv,
+    call_wing_iv: callWingIv,
+    put_wing_iv: putWingIv,
+    iv_skew: skew,
+    iv_skew_weighted_near_atm: weightedSkew,
   };
 }
 
