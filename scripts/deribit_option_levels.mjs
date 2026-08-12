@@ -169,6 +169,52 @@ export async function computeLevels() {
   };
 }
 
+/**
+ * Live order book snapshot for BTC-PERPETUAL. This is NOT positioned/committed
+ * like options OI — it's a point-in-time view of resting orders that can move
+ * or vanish within seconds. Useful for history/analysis, but always caveat it
+ * as a snapshot, not a structural level, when presenting it.
+ */
+export async function fetchOrderBookSummary(depth = 100) {
+  const resp = await fetchJson(`https://www.deribit.com/api/v2/public/get_order_book?instrument_name=BTC-PERPETUAL&depth=${depth}`);
+  const r = resp.result;
+  const topBySize = (levels, n) => [...levels].sort((a, b) => b[1] - a[1]).slice(0, n);
+  const sumSize = levels => levels.reduce((s, [, size]) => s + size, 0);
+  const topBids = topBySize(r.bids, 8);
+  const topAsks = topBySize(r.asks, 8);
+  return {
+    mark_price: r.mark_price,
+    best_bid: r.best_bid_price,
+    best_ask: r.best_ask_price,
+    top_bid_wall: topBids[0] ? { price: topBids[0][0], size: topBids[0][1] } : null,
+    top_ask_wall: topAsks[0] ? { price: topAsks[0][0], size: topAsks[0][1] } : null,
+    bid_wall_sum_top8: sumSize(topBids),
+    ask_wall_sum_top8: sumSize(topAsks),
+  };
+}
+
+/** Current funding rate + perp OI, plus rate ~4h ago for a short trend read. */
+export async function fetchFundingSummary() {
+  const ticker = await fetchJson('https://www.deribit.com/api/v2/public/ticker?instrument_name=BTC-PERPETUAL');
+  const t = ticker.result;
+  const now = Date.now();
+  const fourHoursAgo = now - 4 * 3600 * 1000;
+  let rate4hAgo = null;
+  try {
+    const hist = await fetchJson(`https://www.deribit.com/api/v2/public/get_funding_rate_history?instrument_name=BTC-PERPETUAL&start_timestamp=${fourHoursAgo}&end_timestamp=${now}`);
+    const points = hist.result;
+    if (points.length) rate4hAgo = points[0].interest_8h;
+  } catch { /* history endpoint is best-effort */ }
+  return {
+    current_funding_8h: t.current_funding,
+    funding_8h: t.funding_8h,
+    funding_8h_4h_ago: rate4hAgo,
+    perp_open_interest_usd: t.open_interest,
+    volume_24h_btc: t.stats.volume,
+    price_change_24h_pct: t.stats.price_change,
+  };
+}
+
 import { fileURLToPath } from 'url';
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
